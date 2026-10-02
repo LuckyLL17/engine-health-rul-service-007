@@ -1,3 +1,4 @@
+import { telemetryFingerprint, telemetryKey } from './ordering.js';
 import { Anomaly, Component, Engine, EngineStatus, HealthAssessment, ModelVersion, RulPrediction, TelemetrySample } from './types.js';
 
 const limits = { exhaustGasTemp: 760, vibration: 3.2, oilPressureMin: 3.1, fuelFlowMax: 310 };
@@ -5,25 +6,67 @@ const clamp = (value: number, min = 0, max = 100) => Math.max(min, Math.min(max,
 const round = (value: number, digits = 2) => Number(value.toFixed(digits));
 const statusFor = (score: number): EngineStatus => score >= 85 ? 'healthy' : score >= 70 ? 'watch' : score >= 50 ? 'degraded' : 'critical';
 
-export function validateTelemetry(samples: TelemetrySample[]): { accepted: TelemetrySample[]; rejected: TelemetrySample[]; anomalies: Anomaly[] } {
-  const accepted: TelemetrySample[] = [], rejected: TelemetrySample[] = [], anomalies: Anomaly[] = [];
+export type TelemetryValidation = {
+  accepted: TelemetrySample[];
+  rejected: TelemetrySample[];
+  duplicates: TelemetrySample[];
+  anomalies: Anomaly[];
+};
+
+/**
+ * 按提交顺序逐条校验，绝不静默重排——迟到样本一旦混入，会改写缺失区间和退化趋势，
+ * 因此任何时间戳/cycle 倒退都显式标记为 order_violation 并剔除。
+ * 完全相同的重复提交幂等折叠：不计入质量，也不会用零间隔掩盖缺失区间。
+ */
+export function validateTelemetry(samples: TelemetrySample[]): TelemetryValidation {
+  const accepted: TelemetrySample[] = [], rejected: TelemetrySample[] = [], duplicates: TelemetrySample[] = [], anomalies: Anomaly[] = [];
+  const seen = new Map<string, TelemetrySample>();
   let previous: TelemetrySample | undefined;
-  for (const sample of [...samples].sort((a, b) => a.timestamp.localeCompare(b.timestamp))) {
+  const pushAnomaly = (engineId: string, anomaly: Omit<Anomaly, 'id' | 'engineId'>) => anomalies.push({ ...anomaly, id: `AN-${anomalies.length + 1}`, engineId });
+
+  for (const sample of samples) {
     const values = [sample.rpm, sample.exhaustGasTemp, sample.fuelFlow, sample.vibration, sample.oilPressure, sample.oilTemperature, sample.altitude, sample.thrust];
-    if (!sample.timestamp || values.some(value => !Number.isFinite(value))) {
-      rejected.push(sample); anomalies.push({ id: `AN-${anomalies.length + 1}`, engineId: sample.engineId, timestamp: sample.timestamp, type: 'range_violation', severity: 'high', message: '传感器样本包含非法数值', evidence: { cycle: sample.cycle } }); continue;
+    if (!sample.timestamp || Number.isNaN(Date.parse(sample.timestamp)) || values.some(value => !Number.isFinite(value))) {
+      rejected.push(sample);
+      pushAnomaly(sample.engineId, { timestamp: sample.timestamp, type: 'range_violation', severity: 'high', message: '传感器样本包含非法数值', evidence: { cycle: sample.cycle } });
+      continue;
+    }
+    const key = telemetryKey(sample);
+    const known = seen.get(key);
+    if (known) {
+      if (telemetryFingerprint(known) === telemetryFingerprint(sample)) {
+        duplicates.push(sample);
+      } else {
+        rejected.push(sample);
+        pushAnomaly(sample.engineId, { timestamp: sample.timestamp, type: 'duplicate_conflict', severity: 'high', message: '同一时间戳与 cycle 存在内容冲突的重复样本，已拒绝', evidence: { cycle: sample.cycle, key } });
+      }
+      continue;
     }
     if (sample.exhaustGasTemp > limits.exhaustGasTemp || sample.fuelFlow > limits.fuelFlowMax || sample.vibration > 6 || sample.oilPressure < 1) {
-      rejected.push(sample); anomalies.push({ id: `AN-${anomalies.length + 1}`, engineId: sample.engineId, timestamp: sample.timestamp, type: 'range_violation', severity: 'high', sensor: 'multi', message: '样本超出物理安全范围，已从评分中剔除', evidence: { exhaustGasTemp: sample.exhaustGasTemp, vibration: sample.vibration, oilPressure: sample.oilPressure } }); continue;
+      rejected.push(sample);
+      pushAnomaly(sample.engineId, { timestamp: sample.timestamp, type: 'range_violation', severity: 'high', sensor: 'multi', message: '样本超出物理安全范围，已从评分中剔除', evidence: { exhaustGasTemp: sample.exhaustGasTemp, vibration: sample.vibration, oilPressure: sample.oilPressure } });
+      continue;
     }
     if (previous) {
-      const gap = new Date(sample.timestamp).getTime() - new Date(previous.timestamp).getTime();
-      if (gap > 15 * 60_000) anomalies.push({ id: `AN-${anomalies.length + 1}`, engineId: sample.engineId, timestamp: sample.timestamp, type: 'missing_interval', severity: 'medium', message: '传感器时间序列存在采样间隔缺失', evidence: { gapMinutes: round(gap / 60_000) } });
-      if (Math.abs(sample.vibration - previous.vibration) > 0.65) anomalies.push({ id: `AN-${anomalies.length + 1}`, engineId: sample.engineId, timestamp: sample.timestamp, type: 'sensor_spike', severity: 'medium', sensor: 'vibration', message: '振动信号出现突变', evidence: { previous: previous.vibration, current: sample.vibration } });
+      const timeDelta = Date.parse(sample.timestamp) - Date.parse(previous.timestamp);
+      const cycleDelta = sample.cycle - previous.cycle;
+      if (timeDelta < 0 || cycleDelta < 0) {
+        rejected.push(sample);
+        pushAnomaly(sample.engineId, { timestamp: sample.timestamp, type: 'order_violation', severity: 'high', message: '遥测样本相对前序样本发生时间戳或 cycle 倒退，拒绝乱序样本', evidence: { cycle: sample.cycle, previousCycle: previous.cycle, timeDeltaMinutes: round(timeDelta / 60_000), cycleDelta } });
+        continue;
+      }
+      if (timeDelta > 15 * 60_000) {
+        pushAnomaly(sample.engineId, { timestamp: sample.timestamp, type: 'missing_interval', severity: 'medium', message: '传感器时间序列存在采样间隔缺失', evidence: { gapMinutes: round(timeDelta / 60_000) } });
+      }
+      if (Math.abs(sample.vibration - previous.vibration) > 0.65) {
+        pushAnomaly(sample.engineId, { timestamp: sample.timestamp, type: 'sensor_spike', severity: 'medium', sensor: 'vibration', message: '振动信号出现突变', evidence: { previous: previous.vibration, current: sample.vibration } });
+      }
     }
-    accepted.push(sample); previous = sample;
+    seen.set(key, sample);
+    accepted.push(sample);
+    previous = sample;
   }
-  return { accepted, rejected, anomalies };
+  return { accepted, rejected, duplicates, anomalies };
 }
 
 function normalizedTemperature(sample: TelemetrySample): number { return sample.exhaustGasTemp - sample.ambientTemperature * .35 - (sample.phase === 'takeoff' ? 34 : sample.phase === 'climb' ? 20 : 0); }
@@ -39,10 +82,11 @@ export function assessEngine(engine: Engine, samples: TelemetrySample[], model: 
     ['hot_section', temperatureRisk, ['排气温度裕度下降', '高温阶段的温度归一化值偏高']], ['compressor', fuelRisk, ['单位推力燃油流量上升', '工况归一化后的效率指标偏弱']], ['bearing', vibrationRisk, ['振动幅值趋势上升', '存在突变样本需要复核']], ['lubrication', oilRisk, ['滑油压力裕度降低', '建议结合传感器校准记录复核']]
   ];
   const risks = componentRisks.map(([component, componentRisk, drivers]) => ({ component, score: round(componentRisk), status: statusFor(100 - componentRisk), drivers, estimatedCyclesToLimit: Math.max(20, Math.round((100 - componentRisk) * 18)) }));
-  const explanations = [`模型 ${model.label} 使用 ${usable.length} 个有效样本完成评估`, `最高温度风险 ${round(temperatureRisk)}，最高振动风险 ${round(vibrationRisk)}`, `数据质量得分 ${round(usable.length / Math.max(samples.length, 1) * 100)}，剔除 ${checked.rejected.length} 个异常样本`];
+  const uniqueCount = Math.max(samples.length - checked.duplicates.length, 1);
+  const explanations = [`模型 ${model.label} 使用 ${usable.length} 个有效样本完成评估`, `最高温度风险 ${round(temperatureRisk)}，最高振动风险 ${round(vibrationRisk)}`, `数据质量得分 ${round(usable.length / uniqueCount * 100)}，剔除 ${checked.rejected.length} 个异常样本，折叠 ${checked.duplicates.length} 个重复提交`];
   const anomalies = [...checked.anomalies];
   if (degradationRisk > 35) anomalies.push({ id: `AN-${anomalies.length + 1}`, engineId: engine.id, timestamp: new Date().toISOString(), type: 'degradation', severity: degradationRisk > 60 ? 'high' : 'medium', message: '关键退化指标超过关注阈值', evidence: { degradationRisk: round(degradationRisk), vibrationSlope: round(slope(vibration), 4) } });
-  return { assessmentId: `ASSESS-${Date.now()}`, engineId: engine.id, modelVersion: model.id, createdAt: new Date().toISOString(), sampleCount: samples.length, healthScore, status: statusFor(healthScore), dataQuality: { score: round(usable.length / Math.max(samples.length, 1) * 100), usableSamples: usable.length, rejectedSamples: checked.rejected.length, missingIntervals: checked.anomalies.filter(item => item.type === 'missing_interval').length }, indicators: { exhaustTemperatureMargin: round(limits.exhaustGasTemp - Math.max(...temps, 0)), fuelEfficiencyIndex: round(100 - fuelRisk), vibrationRisk: round(vibrationRisk), oilPressureMargin: round(Math.min(...oil, 4.6) - limits.oilPressureMin), degradationSlope: round(degradationSlope, 4) }, componentRisks: risks, anomalies, explanation: explanations };
+  return { assessmentId: `ASSESS-${Date.now()}`, engineId: engine.id, modelVersion: model.id, createdAt: new Date().toISOString(), sampleCount: samples.length, healthScore, status: statusFor(healthScore), dataQuality: { score: round(usable.length / uniqueCount * 100), usableSamples: usable.length, rejectedSamples: checked.rejected.length, duplicateSamples: checked.duplicates.length, missingIntervals: checked.anomalies.filter(item => item.type === 'missing_interval').length }, indicators: { exhaustTemperatureMargin: round(limits.exhaustGasTemp - Math.max(...temps, 0)), fuelEfficiencyIndex: round(100 - fuelRisk), vibrationRisk: round(vibrationRisk), oilPressureMargin: round(Math.min(...oil, 4.6) - limits.oilPressureMin), degradationSlope: round(degradationSlope, 4) }, componentRisks: risks, anomalies, explanation: explanations };
 }
 
 export function predictRul(engine: Engine, assessment: HealthAssessment, horizonCycles: number, model: ModelVersion): RulPrediction {

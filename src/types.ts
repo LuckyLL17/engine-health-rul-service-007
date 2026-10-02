@@ -45,11 +45,24 @@ export type Anomaly = {
   id: string;
   engineId: string;
   timestamp: string;
-  type: 'range_violation' | 'sensor_spike' | 'sensor_drift' | 'missing_interval' | 'phase_mismatch' | 'degradation';
+  type: 'range_violation' | 'sensor_spike' | 'sensor_drift' | 'missing_interval' | 'phase_mismatch' | 'degradation' | 'order_violation' | 'duplicate_conflict';
   severity: 'low' | 'medium' | 'high';
   sensor?: string;
   message: string;
   evidence: Record<string, number | string>;
+};
+
+export type IngestRejectionReason = 'invalid_structure' | 'order_violation' | 'duplicate_conflict';
+
+export type QuarantinedSample = {
+  id: string;
+  reason: IngestRejectionReason;
+  receivedAt: string;
+  engineId: string;
+  timestamp: string;
+  cycle: number;
+  detail: string;
+  sample: TelemetrySample;
 };
 
 export type ComponentRisk = {
@@ -68,7 +81,7 @@ export type HealthAssessment = {
   sampleCount: number;
   healthScore: number;
   status: EngineStatus;
-  dataQuality: { score: number; usableSamples: number; rejectedSamples: number; missingIntervals: number };
+  dataQuality: { score: number; usableSamples: number; rejectedSamples: number; duplicateSamples: number; missingIntervals: number };
   indicators: {
     exhaustTemperatureMargin: number;
     fuelEfficiencyIndex: number;
