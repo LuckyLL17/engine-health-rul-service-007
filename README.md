@@ -7,6 +7,9 @@
 - 发动机档案与型号配置
 - 飞行架次和多传感器时序导入
 - 时间戳、单位、范围和单调性校验
+- 乱序批次确定性拒绝（按 `(timestamp, cycle)` 高水位），违规样本进入隔离区并产生 `out_of_order` 异常标记
+- 重复提交幂等去重、同键内容冲突拒绝，合法样本不受影响仍可使用
+- 遥测存储保持全局规范有序，重启后自动重放修复历史乱序/重复数据
 - 缺失值线性插值与异常点剔除
 - 飞行阶段工况归一化
 - 排气温度裕度、燃油效率、振动风险、滑油压力裕度计算
@@ -41,6 +44,7 @@ GET  /api/models
 POST /api/engines/import
 GET  /api/engines/:id
 GET  /api/engines/:id/telemetry
+GET  /api/engines/:id/quarantine
 POST /api/engines/:id/health-assessment
 POST /api/engines/:id/rul-prediction
 POST /api/engines/:id/replay
